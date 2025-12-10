@@ -14,18 +14,21 @@ import requests  # pip install requests
 # =============== CONFIG ===============
 
 GMAIL_USER = os.environ.get("GMAIL_USER", "yap32k@gmail.com")
-GMAIL_PASS = os.environ.get("GMAIL_PASS", "intn rkry alig xhtl")
+GMAIL_PASS = os.environ.get("GMAIL_PASS", "intn rkry alig xhtl")  # app password
 
 IMAP_HOST = "imap.gmail.com"
 IMAP_FOLDER = "INBOX"
 
 # API de tu backend Spring
-API_BASE_URL = os.environ.get("ALERT_API_BASE", "http://192.168.0.248:8080")
+#API_BASE_URL = os.environ.get("ALERT_API_BASE", "http://192.168.0.248:8080")
+API_BASE_URL = os.environ.get("ALERT_API_BASE", "https://samloto.com:4016")
 ALERT_ENDPOINT = f"{API_BASE_URL}/api/alerts"
 
+COMPANY_ID = int(os.environ.get("ALERT_COMPANY_ID", "1"))
+
 # Ventana activa / pausa
-WORK_WINDOW_SECONDS = 60          # trabaja 1 minuto
-POLL_INTERVAL_SECONDS = 10        # chequea cada 10 s dentro de ese minuto
+WORK_WINDOW_SECONDS = 60            # trabaja 1 minuto
+POLL_INTERVAL_SECONDS = 10          # chequea cada 10 s dentro de ese minuto
 SLEEP_BETWEEN_CYCLES_SECONDS = 120  # duerme 2 minutos
 
 # Caché diario
@@ -55,16 +58,20 @@ def connect():
     return mail
 
 
-def fetch_today_unseen(mail):
+def fetch_recent_any(mail, days_back: int = 1):
     """
-    Devuelve IDs de correos NO LEÍDOS cuyo día es HOY.
-    Gmail interpreta SINCE por fecha (no hora), así que filtra a nivel de día.
+    Devuelve IDs de correos (LEÍDOS y NO LEÍDOS) desde hace 'days_back' días.
+    Ej: days_back=1 -> desde AYER (incluye ayer y hoy).
+
+    OJO: ahora NO filtramos por UNSEEN.
+    El control de duplicados lo hace solo el caché (Message-ID por día).
     """
-    today = datetime.now().strftime("%d-%b-%Y")  # ej "05-Dec-2025"
-    status, data = mail.search(None, "UNSEEN", "SINCE", today)
+    date_from = (datetime.now() - timedelta(days=days_back)).strftime("%d-%b-%Y")
+    # Antes: search(None, "UNSEEN", "SINCE", date_from)
+    status, data = mail.search(None, "SINCE", date_from)
 
     if status != "OK":
-        print("Error al buscar mensajes UNSEEN SINCE hoy:", status)
+        print("Error al buscar mensajes SINCE", date_from, ":", status)
         return []
 
     return data[0].split()
@@ -107,7 +114,6 @@ def load_today_cache():
 
 
 def append_cache_key(cache_key: str):
-    # Carga, añade y regraba. Para volumen bajo está OK.
     path = get_today_cache_path()
     keys = load_today_cache()
     if cache_key in keys:
@@ -166,26 +172,61 @@ def extract_body_text(msg):
 
 def parse_subject(subject: str):
     """
-    Ejemplo: 'Alarma - IMPACTO - MG069 (308FG25-3)'
-    -> tipo = IMPACTO
-       vehicleCode = MG069
+    Ejemplo típico:
+      'Alarma - IMPACTO - MG069 (308FG25-3)'
+
+    Devuelve:
+      alert_type    -> 'IMPACTO'
+      vehicle_code  -> 'MG069'
+      license_plate -> '308FG25-3' (si viene entre paréntesis)
+      template_src  -> ALARM_EMAIL / CHECKLIST_EMAIL / GENERIC_EMAIL
     """
-    tipo = None
+    alert_type = None
     vehicle_code = None
+    license_plate = None
 
     if not subject:
-        return tipo, vehicle_code
+        return alert_type, vehicle_code, license_plate, "GENERIC_EMAIL"
 
-    # Separar por '-'
+    subj_lower = subject.lower()
+    if "checklist" in subj_lower:
+        template_source = "CHECKLIST_EMAIL"
+    elif "alarma" in subj_lower:
+        template_source = "ALARM_EMAIL"
+    else:
+        template_source = "GENERIC_EMAIL"
+
     parts = [p.strip() for p in subject.split("-")]
     if len(parts) >= 3:
         # Alarma | IMPACTO | MG069 (308FG25-3)
-        tipo = parts[1].strip()
+        alert_type = parts[1].strip() or None
         third = parts[2].strip()
-        # Tomamos el primer token como código
-        vehicle_code = third.split()[0]
 
-    return tipo, vehicle_code
+        # "MG069 (308FG25-3)" -> código + placa en paréntesis
+        m = re.match(r"([^\s(]+)\s*\(([^)]+)\)", third)
+        if m:
+            vehicle_code = m.group(1).strip() or None
+            license_plate = m.group(2).strip() or None
+        else:
+            tokens = third.split()
+            if tokens:
+                vehicle_code = tokens[0].strip() or None
+
+    return alert_type, vehicle_code, license_plate, template_source
+
+
+def parse_plant(body_text: str):
+    """
+    Busca una línea tipo:
+      'Planta: ABI-MA-PE-T1-Ate Beer'
+      'Sede: ...'
+    """
+    for line in body_text.splitlines():
+        line_clean = line.strip()
+        m = re.search(r"(Planta|Sede)\s*:\s*(.+)", line_clean, re.IGNORECASE)
+        if m:
+            return m.group(2).strip()
+    return None
 
 
 def parse_area(body_text: str):
@@ -195,20 +236,44 @@ def parse_area(body_text: str):
     area = None
     for line in body_text.splitlines():
         line_clean = line.strip()
-        m = re.search(r"Area\s*:\s*(.+)", line_clean, re.IGNORECASE)
+        m = re.search(r"Área?\s*:\s*(.+)", line_clean, re.IGNORECASE)
         if m:
             area = m.group(1).strip()
             break
     return area
 
 
+def parse_operator(body_text: str):
+    """
+    Intenta extraer nombre e ID del operador, si vinieran en el correo.
+    """
+    operator_name = None
+    operator_id = None
+
+    for line in body_text.splitlines():
+        line_clean = line.strip()
+
+        # Operador: Juan Pérez
+        m_name = re.search(r"Operador\s*:\s*(.+)", line_clean, re.IGNORECASE)
+        if m_name and not operator_name:
+            operator_name = m_name.group(1).strip()
+
+        # ID Operador: 12345  /  DNI: 12345678
+        m_id = re.search(r"(ID\s*Operador|DNI)\s*:\s*(.+)", line_clean, re.IGNORECASE)
+        if m_id and not operator_id:
+            operator_id = m_id.group(2).strip()
+
+    return operator_name, operator_id
+
+
 def parse_event_time_from_body(body_text: str, fallback_dt_utc: datetime):
     """
-    Intenta leer 'Alarma Fecha: 05-Dic-2025 Hora: 09:42' o 'Fecha: 05-Dic-2025 Hora: 09:42'
+    Intenta leer:
+      'Alarma Fecha: 05-Dic-2025 Hora: 09:42'
+    o:
+      'Fecha: 05-Dic-2025 Hora: 09:42'
     Si no puede, usa la fecha del header (fallback_dt_utc).
     """
-    # Buscamos algo tipo '05-Dic-2025' y '09:42'
-    # Ojo, los meses vienen en español abreviado.
     pattern = re.compile(
         r"(?:Alarma\s+Fecha|Fecha)\s*:\s*([0-9]{2}-[A-Za-z]{3}-[0-9]{4}).*?Hora\s*:\s*([0-9]{2}:[0-9]{2})",
         re.IGNORECASE | re.DOTALL,
@@ -221,7 +286,6 @@ def parse_event_time_from_body(body_text: str, fallback_dt_utc: datetime):
     date_str = match.group(1)  # ej "05-Dic-2025"
     time_str = match.group(2)  # ej "09:42"
 
-    # Mapeo meses esp -> número
     months = {
         "ene": 1, "feb": 2, "mar": 3, "abr": 4, "may": 5, "jun": 6,
         "jul": 7, "ago": 8, "sep": 9, "oct": 10, "nov": 11, "dic": 12,
@@ -234,7 +298,6 @@ def parse_event_time_from_body(body_text: str, fallback_dt_utc: datetime):
             return fallback_dt_utc
 
         hh, mm = time_str.split(":")
-        # Construimos en horario de Lima
         dt_lima = datetime(
             year=int(y),
             month=mon,
@@ -250,38 +313,94 @@ def parse_event_time_from_body(body_text: str, fallback_dt_utc: datetime):
         return fallback_dt_utc
 
 
+def guess_severity(alert_type: str, body_text: str) -> str:
+    """
+    Heurística sencilla para severidad:
+      - IMPACTO / sin condiciones -> CRITICAL / BLOQUEA_OPERACION
+      - EXCESO VELOCIDAD -> WARNING
+      - resto -> INFO
+    """
+    t = (alert_type or "").upper()
+    text = (body_text or "").lower()
+
+    if "sin condiciones" in text or "bloquea" in text:
+        return "BLOQUEA_OPERACION"
+
+    if "IMPACTO" in t:
+        return "CRITICAL"
+
+    if "EXCESO" in t or "VELOCIDAD" in t:
+        return "WARNING"
+
+    return "INFO"
+
+
 def build_alert_payload(subject: str, body_text: str, msg_dt_utc: datetime) -> dict:
-    alert_type, vehicle_code = parse_subject(subject)
+    """
+    Construye el JSON que espera CreateAlertRequest.
+    """
+    alert_type, vehicle_code, license_plate, template_source = parse_subject(subject)
+    plant = parse_plant(body_text)
     area = parse_area(body_text)
-    event_time = parse_event_time_from_body(body_text, msg_dt_utc)
+    operator_name, operator_id = parse_operator(body_text)
+
+    event_time_dt = parse_event_time_from_body(body_text, msg_dt_utc)
+    severity = guess_severity(alert_type, body_text)
 
     if not vehicle_code:
         vehicle_code = "UNKNOWN"
 
     if not alert_type:
-        # Como fallback, tratamos de encontrar IMPACTO / EXCESO / etc en el body
-        m = re.search(r"(IMPACTO|EXCESO\s+VELOCIDAD|ALARMA)", body_text, re.IGNORECASE)
+        # fallback: buscamos palabras en el body
+        m = re.search(
+            r"(IMPACTO|EXCESO\s+VELOCIDAD|CHECKLIST|ALARMA)",
+            body_text,
+            re.IGNORECASE,
+        )
         if m:
             alert_type = m.group(1).upper()
         else:
             alert_type = "DESCONOCIDO"
 
     short_description = f"{alert_type} - {vehicle_code}"
+    if plant:
+        short_description += f" - Planta: {plant}"
     if area:
         short_description += f" - Área: {area}"
-    short_description = short_description[:500]
+    short_description = short_description[:1000]
+
+    raw_payload = body_text or (subject or "")
+    if not raw_payload.strip():
+        raw_payload = "EMPTY_EMAIL"
 
     payload = {
+        # obligatorios
         "vehicleCode": vehicle_code,
-        "type": alert_type,
-        "subject": subject[:255] if subject else None,
+        "alertType": alert_type,
+        "eventTime": event_time_dt.isoformat(),  # ZonedDateTime en backend
+
+        "companyId": COMPANY_ID,
+        
+        # opcionales del modelo
+        "licensePlate": license_plate,
+        "alertSubtype": None,          # TODO: cuando haya patrones claros
+        "templateSource": template_source,
+        "severity": severity,
+
+        "subject": (subject[:255] if subject else None),
+        "plant": plant,
         "area": area,
-        "operatorName": None,  # TODO: parsear "Operador:" si lo necesitas
-        "operatorId": None,    # TODO: parsear "ID Operador:"
-        # Event time en ISO8601
-        "eventTime": event_time.isoformat(),
+        "ownerOrVendor": None,         # TODO: parsear "Proveedor:" si lo ves
+        "brandModel": None,            # TODO: parsear "Marca/Modelo:" si lo hay
+
+        "operatorName": operator_name,
+        "operatorId": operator_id,
+
         "shortDescription": short_description,
-        "rawPayload": body_text[:5000],  # por si acaso limitas tamaño
+        "details": None,               # para checklists largos más adelante
+
+        # requerido @NotBlank
+        "rawPayload": raw_payload[:5000],
     }
 
     return payload
@@ -290,7 +409,7 @@ def build_alert_payload(subject: str, body_text: str, msg_dt_utc: datetime) -> d
 def send_alert_to_api(payload: dict) -> bool:
     try:
         resp = requests.post(ALERT_ENDPOINT, json=payload, timeout=10)
-        if resp.status_code >= 200 and resp.status_code < 300:
+        if 200 <= resp.status_code < 300:
             print(f">>> API OK ({resp.status_code}) - alerta registrada")
             return True
         else:
@@ -333,24 +452,24 @@ def process_message(mail, msg_id, processed_keys: set):
 
     body_text = extract_body_text(msg)
 
-    # Aquí puedes refinar: por ahora buscamos "Alarma" en subject o body.
+    # Ahora consideramos también correos de checklist, etc.
     text_to_search = (subject or "") + "\n" + (body_text or "")
-    if "alarma" not in text_to_search.lower():
-        print(">>> No parece un correo de alarma (no contiene 'alarma'). No se envía a la API.")
+    low = text_to_search.lower()
+    if ("alarma" not in low) and ("checklist" not in low):
+        print(">>> No parece un correo de alerta (no contiene 'alarma' ni 'checklist'). No se envía a la API.")
         return
 
-    # Construimos payload para la API
+    # Construimos payload para la API (CreateAlertRequest)
     payload = build_alert_payload(subject, body_text, msg_dt_utc)
 
     print("Payload a enviar a la API:")
-    print(payload)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
 
     if send_alert_to_api(payload):
-        # Solo marcamos en caché si la API respondió OK
         append_cache_key(cache_key)
         processed_keys.add(cache_key)
 
-        # Marcamos como leído para no re-procesar por IMAP
+        # Marcamos como leído por si estaba no leído (inofensivo si ya estaba leído)
         mail.store(msg_id, "+FLAGS", "\\Seen")
     else:
         print(">>> La API falló, NO se marca como procesado para reintentar luego.")
@@ -361,20 +480,20 @@ def check_mail_once():
     print(f"Chequeando correos a las {now_lima.isoformat()} (hora Lima)")
 
     processed_keys = load_today_cache()
-
     print(f"Claves ya procesadas hoy: {len(processed_keys)}")
 
     mail = connect()
-    print("Conectado a Gmail IMAP, buscando UNSEEN de HOY…")
+    print("Conectado a Gmail IMAP, buscando correos (leídos y no leídos) desde ayer…")
 
     try:
-        unseen_ids = fetch_today_unseen(mail)
-        if unseen_ids:
-            print(f"Encontrados {len(unseen_ids)} correo(s) NO leídos de hoy.")
-            for msg_id in unseen_ids:
+        # Ahora usamos fetch_recent_any (SIN UNSEEN)
+        msg_ids = fetch_recent_any(mail, days_back=1)
+        if msg_ids:
+            print(f"Encontrados {len(msg_ids)} correo(s) desde ayer (leídos y no leídos).")
+            for msg_id in msg_ids:
                 process_message(mail, msg_id, processed_keys)
         else:
-            print("Sin correos nuevos (UNSEEN de hoy).")
+            print("Sin correos en el rango (desde ayer).")
     finally:
         mail.logout()
         print("Desconectado de IMAP.")
