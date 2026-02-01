@@ -8,8 +8,8 @@ from datetime import datetime, timedelta, timezone
 
 # =============== CONFIG ===============
 
-GMAIL_USER = os.environ.get("GMAIL_USER", "es123y123@gmail.com")
-GMAIL_PASS = os.environ.get("GMAIL_PASS", "phzb ilbk uxyt hswd")  # App password
+GMAIL_USER = os.environ.get("GMAIL_USER", "yap32k@gmail.com") # (Reemplazar por la real)
+GMAIL_PASS = os.environ.get("GMAIL_PASS", "intn rkry alig xhtl")  # app password (Reemplazar por la real)
 
 IMAP_HOST = "imap.gmail.com"
 IMAP_FOLDER = "INBOX"

@@ -13,8 +13,8 @@ import requests  # pip install requests
 
 # =============== CONFIG ===============
 
-GMAIL_USER = os.environ.get("GMAIL_USER", "yap32k@gmail.com")
-GMAIL_PASS = os.environ.get("GMAIL_PASS", "intn rkry alig xhtl")  # app password
+GMAIL_USER = os.environ.get("GMAIL_USER", "yap32k@gmail.com") # (Reemplazar por la real)
+GMAIL_PASS = os.environ.get("GMAIL_PASS", "intn rkry alig xhtl")  # app password (Reemplazar por la real)
 
 IMAP_HOST = "imap.gmail.com"
 IMAP_FOLDER = "INBOX"

@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import re
 import json
 import glob
+import html as html_lib
 
 import requests  # pip install requests
 
@@ -199,6 +200,40 @@ def extract_body_text(msg):
             return ""
 
 
+def looks_like_html(s: str) -> bool:
+    if not s:
+        return False
+    low = s.lower()
+    return "<html" in low or "<body" in low or "<br" in low or "</div" in low or "<p" in low
+
+
+def html_to_text(s: str) -> str:
+    """
+    Convierte HTML básico a texto para poder parsear campos (Área, Planta, Operador, etc).
+    Sin dependencias externas.
+    """
+    if not s:
+        return ""
+
+    # saltos de línea típicos
+    s = re.sub(r"(?i)<br\s*/?>", "\n", s)
+    s = re.sub(r"(?i)</p\s*>", "\n", s)
+    s = re.sub(r"(?i)</div\s*>", "\n", s)
+
+    # quitar tags
+    s = re.sub(r"<[^>]+>", " ", s)
+
+    # decode entities
+    s = html_lib.unescape(s)
+
+    # normalizar espacios
+    s = s.replace("\xa0", " ")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n\s*\n+", "\n", s)
+
+    return s.strip()
+
+
 def parse_subject(subject: str):
     alert_type = None
     vehicle_code = None
@@ -232,20 +267,60 @@ def parse_subject(subject: str):
 
 
 def parse_plant(body_text: str):
+    if not body_text:
+        return None
+
     for line in body_text.splitlines():
         line_clean = line.strip()
         m = re.search(r"(Planta|Sede)\s*:\s*(.+)", line_clean, re.IGNORECASE)
         if m:
-            return m.group(2).strip()
+            val = m.group(2).strip()
+            val = re.split(r"\s{2,}|\t|\|", val)[0].strip()
+            return val or None
+
+    m2 = re.search(r"(Planta|Sede)\s*:\s*([^\n\r]+)", body_text, re.IGNORECASE)
+    if m2:
+        val = m2.group(2).strip()
+        val = re.split(r"\s{2,}|\t|\|", val)[0].strip()
+        return val or None
+
     return None
 
 
 def parse_area(body_text: str):
+    """
+    Busca Área / Area / Zona / Ubicación / Lugar, tolerante a formatos.
+    """
+    if not body_text:
+        return None
+
+    # 1) Intento line-by-line
     for line in body_text.splitlines():
         line_clean = line.strip()
-        m = re.search(r"Área?\s*:\s*(.+)", line_clean, re.IGNORECASE)
+        if not line_clean:
+            continue
+
+        m = re.search(
+            r"(?:\bÁrea\b|\bArea\b|\bZona\b|\bUbicación\b|\bUbicacion\b|\bLugar\b)\s*:\s*(.+)",
+            line_clean,
+            re.IGNORECASE,
+        )
         if m:
-            return m.group(1).strip()
+            val = m.group(1).strip()
+            val = re.split(r"\s{2,}|\t|\|", val)[0].strip()
+            return val or None
+
+    # 2) Fallback: buscar en todo el texto (si vino “pegado”)
+    m2 = re.search(
+        r"(?:\bÁrea\b|\bArea\b|\bZona\b|\bUbicación\b|\bUbicacion\b|\bLugar\b)\s*:\s*([^\n\r]+)",
+        body_text,
+        re.IGNORECASE,
+    )
+    if m2:
+        val = m2.group(1).strip()
+        val = re.split(r"\s{2,}|\t|\|", val)[0].strip()
+        return val or None
+
     return None
 
 
@@ -315,18 +390,21 @@ def guess_severity(alert_type: str, body_text: str) -> str:
 
 def build_alert_payload(subject: str, body_text: str, msg_dt_utc: datetime) -> dict:
     alert_type, vehicle_code, license_plate, template_source = parse_subject(subject)
-    plant = parse_plant(body_text)
-    area = parse_area(body_text)
-    operator_name, operator_id = parse_operator(body_text)
 
-    event_time_dt = parse_event_time_from_body(body_text, msg_dt_utc)
-    severity = guess_severity(alert_type, body_text)
+    parse_text = html_to_text(body_text) if looks_like_html(body_text) else (body_text or "")
+
+    plant = parse_plant(parse_text)
+    area = parse_area(parse_text)
+    operator_name, operator_id = parse_operator(parse_text)
+
+    event_time_dt = parse_event_time_from_body(parse_text, msg_dt_utc)
+    severity = guess_severity(alert_type, parse_text)
 
     if not vehicle_code:
         vehicle_code = "UNKNOWN"
 
     if not alert_type:
-        m = re.search(r"(IMPACTO|EXCESO\s+VELOCIDAD|CHECKLIST|ALARMA)", body_text, re.IGNORECASE)
+        m = re.search(r"(IMPACTO|EXCESO\s+VELOCIDAD|CHECKLIST|ALARMA)", parse_text, re.IGNORECASE)
         alert_type = m.group(1).upper() if m else "DESCONOCIDO"
 
     short_description = f"{alert_type} - {vehicle_code}"
@@ -416,12 +494,10 @@ def process_message(mail, msg_id, processed_keys: set, month_cache_fp: str, toda
     payload = build_alert_payload(subject, body_text, msg_dt_utc)
 
     if send_alert_to_api(payload):
-        # Actualiza cache mensual + cache de hoy (para que el listener no reenvíe)
         append_cache_key(month_cache_fp, cache_key)
         append_cache_key(today_cache_fp, cache_key)
         processed_keys.add(cache_key)
 
-        # Marcamos como leído (opcional, pero útil)
         mail.store(msg_id, "+FLAGS", "\\Seen")
         return True
 
