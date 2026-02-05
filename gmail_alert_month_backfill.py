@@ -13,8 +13,8 @@ import html as html_lib
 import requests  # pip install requests
 
 # =============== CONFIG ===============
-GMAIL_USER = os.environ.get("GMAIL_USER", "yap32k@gmail.com") # (Reemplazar por la real)
-GMAIL_PASS = os.environ.get("GMAIL_PASS", "intn rkry alig xhtl")  # app password (Reemplazar por la real)
+GMAIL_USER = os.environ.get("GMAIL_USER", "yap32k@gmail.com")  # (Reemplazar por la real)
+GMAIL_PASS = os.environ.get("GMAIL_PASS", "intn rkry alig xhtl")  # app password (NO hardcodear)
 
 IMAP_HOST = "imap.gmail.com"
 IMAP_FOLDER = "INBOX"
@@ -30,6 +30,9 @@ LIMA_TZ = timezone(timedelta(hours=-5))
 #   ALERT_YEAR=2025 ALERT_MONTH=12 python3 gmail_alert_month_backfill.py
 FORCE_YEAR = os.environ.get("ALERT_YEAR")
 FORCE_MONTH = os.environ.get("ALERT_MONTH")
+
+# SOLO estos tipos se guardan en /api/alerts
+ALLOWED_TYPES = {"IMPACTO", "FRENADA", "ACELERACION"}
 # ======================================
 
 
@@ -64,7 +67,6 @@ def month_range_lima():
     month = int(FORCE_MONTH) if FORCE_MONTH else now.month
 
     start = datetime(year=year, month=month, day=1, tzinfo=LIMA_TZ)
-
     if month == 12:
         end = datetime(year=year + 1, month=1, day=1, tzinfo=LIMA_TZ)
     else:
@@ -215,23 +217,54 @@ def html_to_text(s: str) -> str:
     if not s:
         return ""
 
-    # saltos de línea típicos
     s = re.sub(r"(?i)<br\s*/?>", "\n", s)
     s = re.sub(r"(?i)</p\s*>", "\n", s)
     s = re.sub(r"(?i)</div\s*>", "\n", s)
 
-    # quitar tags
     s = re.sub(r"<[^>]+>", " ", s)
-
-    # decode entities
     s = html_lib.unescape(s)
 
-    # normalizar espacios
     s = s.replace("\xa0", " ")
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n\s*\n+", "\n", s)
 
     return s.strip()
+
+
+def normalize_alert_text(s: str) -> str:
+    if not s:
+        return ""
+    x = s.strip().upper()
+    x = (x.replace("Ó", "O")
+           .replace("Á", "A")
+           .replace("É", "E")
+           .replace("Í", "I")
+           .replace("Ú", "U"))
+    return x
+
+
+def canonical_alert_type(s: str) -> str:
+    """
+    Mapea variaciones a los 3 tipos permitidos:
+      - cualquier cosa que contenga IMPACTO => IMPACTO
+      - que contenga FREN (FRENADA, FRENADO, etc) => FRENADA
+      - que contenga ACELER (ACELERACION, ACELERACIÓN, etc) => ACELERACION
+    """
+    x = normalize_alert_text(s)
+    if "IMPACTO" in x:
+        return "IMPACTO"
+    if "FREN" in x:
+        return "FRENADA"
+    if "ACELER" in x:
+        return "ACELERACION"
+    return ""
+
+
+def guess_allowed_type(subject: str, body_text: str) -> str:
+    t = canonical_alert_type(subject or "")
+    if t:
+        return t
+    return canonical_alert_type(body_text or "")
 
 
 def parse_subject(subject: str):
@@ -288,13 +321,9 @@ def parse_plant(body_text: str):
 
 
 def parse_area(body_text: str):
-    """
-    Busca Área / Area / Zona / Ubicación / Lugar, tolerante a formatos.
-    """
     if not body_text:
         return None
 
-    # 1) Intento line-by-line
     for line in body_text.splitlines():
         line_clean = line.strip()
         if not line_clean:
@@ -310,7 +339,6 @@ def parse_area(body_text: str):
             val = re.split(r"\s{2,}|\t|\|", val)[0].strip()
             return val or None
 
-    # 2) Fallback: buscar en todo el texto (si vino “pegado”)
     m2 = re.search(
         r"(?:\bÁrea\b|\bArea\b|\bZona\b|\bUbicación\b|\bUbicacion\b|\bLugar\b)\s*:\s*([^\n\r]+)",
         body_text,
@@ -376,20 +404,20 @@ def parse_event_time_from_body(body_text: str, fallback_dt_utc: datetime):
 
 
 def guess_severity(alert_type: str, body_text: str) -> str:
-    t = (alert_type or "").upper()
+    t = normalize_alert_text(alert_type or "")
     text = (body_text or "").lower()
 
     if "sin condiciones" in text or "bloquea" in text:
         return "BLOQUEA_OPERACION"
     if "IMPACTO" in t:
         return "CRITICAL"
-    if "EXCESO" in t or "VELOCIDAD" in t:
+    if "FREN" in t or "ACELER" in t:
         return "WARNING"
     return "INFO"
 
 
 def build_alert_payload(subject: str, body_text: str, msg_dt_utc: datetime) -> dict:
-    alert_type, vehicle_code, license_plate, template_source = parse_subject(subject)
+    alert_type_raw, vehicle_code, license_plate, template_source = parse_subject(subject)
 
     parse_text = html_to_text(body_text) if looks_like_html(body_text) else (body_text or "")
 
@@ -398,14 +426,16 @@ def build_alert_payload(subject: str, body_text: str, msg_dt_utc: datetime) -> d
     operator_name, operator_id = parse_operator(parse_text)
 
     event_time_dt = parse_event_time_from_body(parse_text, msg_dt_utc)
+
+    # Tipificación SOLO a los permitidos (o DESCONOCIDO)
+    alert_type = canonical_alert_type(alert_type_raw or "")
+    if not alert_type:
+        alert_type = guess_allowed_type(subject, parse_text) or "DESCONOCIDO"
+
     severity = guess_severity(alert_type, parse_text)
 
     if not vehicle_code:
         vehicle_code = "UNKNOWN"
-
-    if not alert_type:
-        m = re.search(r"(IMPACTO|EXCESO\s+VELOCIDAD|CHECKLIST|ALARMA)", parse_text, re.IGNORECASE)
-        alert_type = m.group(1).upper() if m else "DESCONOCIDO"
 
     short_description = f"{alert_type} - {vehicle_code}"
     if plant:
@@ -458,6 +488,16 @@ def send_alert_to_api(payload: dict) -> bool:
         return False
 
 
+def cache_as_processed(cache_key: str, processed_keys: set, month_cache_fp: str, today_cache_fp: str):
+    """
+    Marca el mensaje como procesado (aunque NO se haya enviado a la API),
+    para que no se re-procese en re-ejecuciones.
+    """
+    append_cache_key(month_cache_fp, cache_key)
+    append_cache_key(today_cache_fp, cache_key)
+    processed_keys.add(cache_key)
+
+
 def process_message(mail, msg_id, processed_keys: set, month_cache_fp: str, today_cache_fp: str):
     status, msg_data = mail.fetch(msg_id, "(RFC822)")
     if status != "OK":
@@ -478,10 +518,24 @@ def process_message(mail, msg_id, processed_keys: set, month_cache_fp: str, toda
 
     body_text = extract_body_text(msg)
 
-    # Filtrado básico: solo correos relevantes
+    # Filtro rápido: si no parece relevante, ni lo cacheamos
     text_to_search = (subject or "") + "\n" + (body_text or "")
     low = text_to_search.lower()
-    if ("alarma" not in low) and ("checklist" not in low):
+    if ("alarma" not in low) and ("checklist" not in low) and ("impacto" not in low) and ("fren" not in low) and ("aceler" not in low):
+        return False
+
+    # 1) Si es checklist, NO enviar, pero SÍ cachear para no re-procesar
+    if "checklist" in low:
+        cache_as_processed(cache_key, processed_keys, month_cache_fp, today_cache_fp)
+        return False
+
+    payload = build_alert_payload(subject, body_text, msg_dt_utc)
+
+    # 2) Solo enviar si el tipo es uno de los permitidos (y también cachear si no lo es)
+    alert_type = payload.get("alertType") or ""
+    if alert_type not in ALLOWED_TYPES:
+        # Ej: ALARMA / DESCONOCIDO / EXCESO VELOCIDAD, etc.
+        cache_as_processed(cache_key, processed_keys, month_cache_fp, today_cache_fp)
         return False
 
     print("=" * 60)
@@ -490,17 +544,16 @@ def process_message(mail, msg_id, processed_keys: set, month_cache_fp: str, toda
     print(f"From: {from_}")
     print(f"Subject: {subject}")
     print(f"Header date (UTC): {msg_dt_utc}")
-
-    payload = build_alert_payload(subject, body_text, msg_dt_utc)
+    print(f"AlertType (allowed): {alert_type}")
 
     if send_alert_to_api(payload):
-        append_cache_key(month_cache_fp, cache_key)
-        append_cache_key(today_cache_fp, cache_key)
-        processed_keys.add(cache_key)
+        cache_as_processed(cache_key, processed_keys, month_cache_fp, today_cache_fp)
 
+        # opcional: marcar como leído si se registró OK
         mail.store(msg_id, "+FLAGS", "\\Seen")
         return True
 
+    # Si falló la API, NO cacheamos => permitirá reintentar en otro run
     return False
 
 
@@ -508,6 +561,7 @@ def main():
     month_start, next_month_start, year, month = month_range_lima()
     print(f"Backfill del mes: {year}-{month:02d}")
     print(f"Rango IMAP (Lima): {month_start} -> {next_month_start}")
+    print(f"ALLOWED_TYPES: {sorted(ALLOWED_TYPES)} (CHECKLIST bloqueado y cacheado)")
 
     month_fp = month_cache_path(year, month)
     today_fp = today_cache_path()
@@ -533,7 +587,7 @@ def main():
                 skipped += 1
 
         print("=" * 60)
-        print(f"FIN. Enviadas a API: {sent} | Saltadas (cache/no-alerta/fallo): {skipped}")
+        print(f"FIN. Enviadas a API (solo allowed): {sent} | Saltadas (cache/irrelevante/fallo): {skipped}")
         print(f"Cache mensual: {month_fp}")
         print(f"Cache hoy: {today_fp}")
 
