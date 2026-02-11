@@ -20,7 +20,7 @@ GMAIL_PASS = os.environ.get("GMAIL_PASS", "intn rkry alig xhtl")  # app password
 IMAP_HOST = "imap.gmail.com"
 IMAP_FOLDER = "INBOX"
 
-API_BASE_URL = os.environ.get("ALERT_API_BASE", "https://samloto.com:4016")
+API_BASE_URL = os.environ.get("ALERT_API_BASE", "http://192.168.0.204:5001")
 ALERT_ENDPOINT = f"{API_BASE_URL}/api/alerts"
 
 COMPANY_ID = int(os.environ.get("ALERT_COMPANY_ID", "1"))
